@@ -531,7 +531,7 @@ class Template extends TemplateBase {
 	 */
 	public function getRightDelimiter()
 	{
-		return $this->right_delimiter ?? $this->getSmarty()->getRightDelimiter();;
+		return $this->right_delimiter ?? $this->getSmarty()->getRightDelimiter();
 	}
 
 	/**
