@@ -78,15 +78,7 @@ if (
     define('PWG_API_KEY_REQUEST', true);
 
     // set pwg_token for api_key request
-    // same logic as PwgServer::isPost()
-    if (!empty($_POST))
-    {
-      $_POST['pwg_token'] = get_pwg_token();
-    }
-    else
-    {
-      $_GET['pwg_token'] = get_pwg_token();
-    }
+    $_POST['pwg_token'] = $_GET['pwg_token'] = get_pwg_token();
 
     // logger
     global $logger;
