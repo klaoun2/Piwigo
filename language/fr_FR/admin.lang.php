@@ -931,6 +931,8 @@ $lang['Purge user cache'] = 'Purger le cache utilisateur';
 $lang['The picture dimensions will be reduced to %dx%d pixels.'] = 'La tailles des images sera réduite à %dx%d pixels.';
 $lang['Mail theme'] = 'Thème des mails';
 $lang['Select at least one tag'] = 'Sélectionnez au moins un tag';
+$lang['Select at least one date'] = 'Sélectionnez au moins une date';
+$lang['Select at least one type'] = 'Sélectionnez au moins un type';
 $lang['Basic settings'] = 'Paramètres de base';
 $lang['Loading...'] = 'Chargement...';
 $lang['Show %s users'] = 'Afficher %s utilisateurs';
@@ -1161,6 +1163,7 @@ $lang['Compact View'] = 'Affichage compact';
 $lang['Tile View'] = 'Affichage tuiles';
 $lang['Line View'] = 'Affichage lignes';
 $lang['Add Album'] = 'Ajouter un album';
+$lang['Add sub-album'] = 'Ajouter un sous-album';
 $lang['Name field must not be empty'] = 'Le nom ne doit pas être vide';
 $lang['Drag and drop to reorder albums'] = 'Réorganisez les albums par glisser/déposer';
 $lang['Apply an automatic order to root albums'] = 'Appliquer un tri automatique sur les albums racines';
@@ -1445,5 +1448,7 @@ $lang['Latest update'] = 'Dernière mise à jour';
 $lang['See available updates'] = 'Voir les mises à jour disponibles';
 $lang['You are about to delete %s groups, are you sure?'] = 'Vous êtes sur le point de supprimer %s groupes, êtes-vous sûr ?';
 $lang['Users not logged in will have these permissions applied. Grant access to private albums only with great caution.'] = 'Ces permissions s\'appliqueront aux utilisateurs non connectés. Faites ainsi preuve de la plus grande précaution en accordant l\'accès aux albums privés.';
+$lang['single day'] = 'Jour unique';
+$lang['period'] = 'Période';
 
 // Leave this line empty
