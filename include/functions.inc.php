@@ -21,6 +21,7 @@ include_once( PHPWG_ROOT_PATH .'include/functions_url.inc.php' );
 include_once( PHPWG_ROOT_PATH .'include/derivative_params.inc.php');
 include_once( PHPWG_ROOT_PATH .'include/derivative_std_params.inc.php');
 include_once( PHPWG_ROOT_PATH .'include/derivative.inc.php');
+include_once( PHPWG_ROOT_PATH .'include/functions_people.inc.php' );
 
 
 /**
@@ -1561,8 +1562,12 @@ INSERT INTO
  * @since 2.6
  *
  * @param string|string[] $params
+ * @param string $condition (optional, @since 15) SQL condition added to the
+ *   WHERE clause with an AND, for example 'value = "..."'. Not escaped: the
+ *   caller is responsible for its content.
+ * @return int number of deleted rows
  */
-function conf_delete_param($params)
+function conf_delete_param($params, $condition=null)
 {
   global $conf;
 
@@ -1572,19 +1577,30 @@ function conf_delete_param($params)
   }
   if (empty($params))
   {
-    return;
+    return 0;
   }
 
   $query = '
 DELETE FROM '.CONFIG_TABLE.'
-  WHERE param IN(\''. implode('\',\'', $params) .'\')
+  WHERE param IN(\''. implode('\',\'', $params) .'\')';
+  if (!empty($condition))
+  {
+    $query.= '
+    AND '.$condition;
+  }
+  $query.= '
 ;';
   pwg_query($query);
+  $nb_deleted = pwg_db_changes();
 
+  // even when the condition matched nothing, the value we had in $conf is
+  // outdated: the row does not exist anymore or holds another value
   foreach ($params as $param)
   {
     unset($conf[$param]);
   }
+
+  return $nb_deleted;
 }
 
 /**
@@ -2683,7 +2699,7 @@ SELECT
   {
     $logger->info('['.__FUNCTION__.'][exec='.$exec_id.'] fetchRemote on '.$url.' has failed');
     send_piwigo_infos_retry_later(1*60*60); // 1 hour later
-    pwg_unique_exec_ends('send_piwigo_infos');
+    pwg_unique_exec_ends('send_piwigo_infos', $exec_id);
     $logger->info('['.__FUNCTION__.'][exec='.$exec_id.'] executed in '.get_elapsed_time($start_time, get_moment()));
     return;
   }
@@ -2985,7 +3001,7 @@ SELECT
     $logger->info('['.__FUNCTION__.'][exec='.$exec_id.'] fetchRemote success, new send_piwigo_infos_last_notice='.$conf['send_piwigo_infos_last_notice']);
   }
 
-  pwg_unique_exec_ends('send_piwigo_infos');
+  pwg_unique_exec_ends('send_piwigo_infos', $exec_id);
   $logger->info('['.__FUNCTION__.'][exec='.$exec_id.'] executed in '.get_elapsed_time($start_time, get_moment()));
 }
 
@@ -3001,9 +3017,49 @@ function send_piwigo_infos_retry_later($wait_time)
   $logger->info('['.__FUNCTION__.'] new send_piwigo_infos_last_notice='.$conf['send_piwigo_infos_last_notice']);
 }
 
+/**
+ * Ensures that only one execution of a given task runs at a time.
+ *
+ * A lock token named "<token_name>_running" is inserted in the config
+ * table with an INSERT IGNORE, which makes the insertion atomic: when
+ * several requests compete, only the first one gets the token, the
+ * others give up. If an existing token is older than $timeout seconds,
+ * it is considered stale (crashed or abandoned execution) and is removed
+ * before trying to get the token.
+ *
+ * The caller must release the token with pwg_unique_exec_ends() once the
+ * task is done.
+ *
+ * Example:
+ *   if ($exec_id = pwg_unique_exec_begins('my_task'))
+ *   {
+ *     // do the work
+ *     pwg_unique_exec_ends('my_task', $exec_id);
+ *   }
+ *
+ * @since 15
+ * @param string $token_name max 32 characters: the token is stored in
+ *   config.param (varchar(40)) with the "_running" suffix (8 characters).
+ *   A longer name gets truncated in the database, the token is never found
+ *   back and the function always returns false.
+ * @param int $timeout in seconds, age after which a running token is
+ *   considered stale
+ * @return string|false execution id (8 hexadecimal characters) if the
+ *   token was obtained, false if another execution is already running
+ */
 function pwg_unique_exec_begins($token_name, $timeout=60)
 {
   global $conf, $logger;
+
+  if (strlen($token_name.'_running') > 40)
+  {
+    trigger_error(
+      __FUNCTION__.', token_name "'.$token_name.'" is too long (max 32 characters)',
+      E_USER_WARNING
+    );
+
+    return false;
+  }
 
   $exec_id = substr(sha1(random_bytes(1000)), 0, 8);
   $logger->info('['.$token_name.'][exec='.$exec_id.'] starts now');
@@ -3014,7 +3070,13 @@ function pwg_unique_exec_begins($token_name, $timeout=60)
     if (time() - $running_exec_start_time > $timeout)
     {
       $logger->info('['.$token_name.'][exec='.$exec_id.'] exec='.$running_exec_id.', timeout stopped by another call to the function');
-      pwg_unique_exec_ends($token_name);
+
+      // only remove the stale token we have seen: $conf was loaded at the
+      // beginning of the request and another call may have replaced it since
+      conf_delete_param(
+        $token_name.'_running',
+        'value = "'.$conf[$token_name.'_running'].'"'
+      );
     }
   }
 
@@ -3026,10 +3088,11 @@ INSERT IGNORE
 ;';
   pwg_query($query);
 
-  list($running_exec) = pwg_db_fetch_row(pwg_query('SELECT value FROM '.CONFIG_TABLE.' WHERE param = "'.$token_name.'_running"'));
-  list($running_exec_id,) = explode('-', $running_exec);
-
-  if ($running_exec_id != $exec_id)
+  // the INSERT IGNORE affects 1 row if we got the token, 0 if another
+  // execution holds it. Reading the token back with a SELECT was a race: the
+  // holder could release it between our INSERT and the SELECT, which then
+  // returned no row.
+  if (pwg_db_changes() != 1)
   {
     $logger->info('['.$token_name.'][exec='.$exec_id.'] skip');
     return false;
@@ -3052,12 +3115,31 @@ SELECT
   return $counter > 0;
 }
 
-function pwg_unique_exec_ends($token_name)
+/**
+ * Releases the token obtained with pwg_unique_exec_begins().
+ *
+ * @param string $token_name
+ * @param string $exec_id (optional, @since 15) execution id returned by
+ *   pwg_unique_exec_begins(). If given, the token is released only if it is
+ *   still ours: an execution which exceeded the timeout may have seen its
+ *   token taken by another call, it must not release the new holder's token.
+ */
+function pwg_unique_exec_ends($token_name, $exec_id=null)
 {
   global $logger;
 
-  conf_delete_param($token_name.'_running');
-  $logger->info('['.$token_name.'] ends now');
+  $condition = null;
+  if (isset($exec_id))
+  {
+    $condition = 'value LIKE "'.$exec_id.'-%"';
+  }
+
+  if (0 == conf_delete_param($token_name.'_running', $condition) and isset($exec_id))
+  {
+    $logger->info('['.$token_name.'][exec='.$exec_id.'] token was not ours anymore (timeout exceeded?)');
+  }
+
+  $logger->info('['.$token_name.']'.(isset($exec_id) ? '[exec='.$exec_id.']' : '').' ends now');
 }
 
 /**
