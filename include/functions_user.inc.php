@@ -731,6 +731,24 @@ SELECT '.$conf['user_fields']['id'].'
 }
 
 /**
+ * Returns an SQL condition comparing an email column with a given email.
+ *
+ * The comparison is case-insensitive but accent-sensitive: the default
+ * collation of the users table (utf8_general_ci, utf8mb4_unicode_ci...)
+ * considers "gmáil.com" equal to "gmail.com", which would let a lookalike
+ * address match another user's account (GHSA-hxf4-pc6v-4gg2).
+ *
+ * @since 16.5
+ * @param string $column SQL column name
+ * @param string $email raw (unescaped) email address
+ * @return string
+ */
+function get_sql_condition_email_equals($column, $email)
+{
+  return 'CAST(LOWER('.$column.') AS BINARY) = CAST(LOWER(\''.pwg_db_real_escape_string($email).'\') AS BINARY)';
+}
+
+/**
  * Returns user identifier thanks to his email.
  *
  * @param string $email
@@ -740,13 +758,11 @@ function get_userid_by_email($email)
 {
   global $conf;
 
-  $email = pwg_db_real_escape_string($email);
-
   $query = '
 SELECT
     '.$conf['user_fields']['id'].'
   FROM '.USERS_TABLE.'
-  WHERE UPPER('.$conf['user_fields']['email'].') = UPPER(\''.$email.'\')
+  WHERE '.get_sql_condition_email_equals($conf['user_fields']['email'], $email).'
 ;';
   $result = pwg_query($query);
 
@@ -1330,6 +1346,7 @@ function find_user_by_username_or_email($username_or_email)
 {
   global $conf;
 
+  $where_email = get_sql_condition_email_equals($conf['user_fields']['email'], $username_or_email);
   $username_or_email = pwg_db_real_escape_string($username_or_email);
 
   $query = '
@@ -1345,7 +1362,6 @@ FROM '.USERS_TABLE.' AS u
   WHERE ';
 
   $where_username = $conf['user_fields']['username'].' = \'' . $username_or_email . '\'';
-  $where_email = $conf['user_fields']['email'].' = \'' . $username_or_email . '\'';
 
   $user = pwg_db_fetch_assoc(pwg_query($query.$where_username))
     ?: pwg_db_fetch_assoc(pwg_query($query.$where_email));
@@ -2089,12 +2105,76 @@ UPDATE '.USER_INFOS_TABLE.'
 }
 
 /**
+ * Checks the value of a user preferences parameter. Core parameters have a
+ * known set of allowed values, other parameters (from plugins for example)
+ * are accepted as is, unless a plugin rejects them with the
+ * "userprefs_is_valid_param" trigger.
+ * @since 16.5
+ *
+ * @param string $param
+ * @param mixed $value
+ * @return bool
+ */
+function userprefs_is_valid_param($param, $value)
+{
+  $allowed_values = array(
+    'admin_theme' => array('clear', 'roma'),
+    'user-manager-view' => array('line', 'compact', 'tile'),
+    'plugin-manager-view' => array('classic', 'line', 'compact'),
+    );
+
+  $boolean_params = array(
+    'promote-mobile-apps',
+    'show_newsletter_subscription',
+    );
+
+  $positive_integer_params = array(
+    'user-manager-pagination',
+    'reset_password_forbidden_until',
+    );
+
+  if (isset($allowed_values[$param]))
+  {
+    $is_valid = in_array($value, $allowed_values[$param], true);
+  }
+  elseif (in_array($param, $boolean_params) or preg_match('/^show_whats_new_/', $param))
+  {
+    $is_valid = is_bool($value);
+  }
+  elseif (in_array($param, $positive_integer_params))
+  {
+    $is_valid = (is_int($value) or (is_string($value) and ctype_digit($value))) and $value > 0;
+  }
+  elseif ('gallery_search_filters' == $param)
+  {
+    $is_valid = is_array($value);
+    if ($is_valid)
+    {
+      foreach ($value as $field)
+      {
+        if (!is_string($field) or !preg_match('/^[a-zA-Z0-9_-]+$/', $field))
+        {
+          $is_valid = false;
+          break;
+        }
+      }
+    }
+  }
+  else
+  {
+    $is_valid = true;
+  }
+
+  return trigger_change('userprefs_is_valid_param', $is_valid, $param, $value);
+}
+
+/**
  * Add or update a user preferences parameter
  * @since 13
  *
  * @param string $param
- * @param string $value
- * @param boolean $updateGlobal update global *$conf* variable
+ * @param mixed $value
+ * @return bool false if the value is not valid for this parameter (nothing is saved)
  */
 function userprefs_update_param($param, $value)
 {
@@ -2110,9 +2190,16 @@ function userprefs_update_param($param, $value)
     $value = false;
   }
 
+  if (!userprefs_is_valid_param($param, $value))
+  {
+    return false;
+  }
+
   $user['preferences'][$param] = $value;
 
   userprefs_save();
+
+  return true;
 }
 
 /**
@@ -2158,7 +2245,9 @@ function userprefs_get_param($param, $default_value=null)
 {
   global $user;
 
-  if (isset($user['preferences'][$param]))
+  // a value saved before the preferences were validated (eg an admin_theme
+  // pointing outside admin/themes) is ignored
+  if (isset($user['preferences'][$param]) and userprefs_is_valid_param($param, $user['preferences'][$param]))
   {
     return $user['preferences'][$param];
   }
@@ -2238,6 +2327,41 @@ function check_and_save_user_infos($params)
           'message' => 'This user does not exist.'
         )
       );
+    }
+
+    // only webmasters can change the username or email of other
+    // webmaster/admin users: with the email, an admin could take over a
+    // webmaster account through the lost password procedure
+    if (!is_webmaster() and $params['user_id'][0] != $user['id'])
+    {
+      $query = '
+SELECT
+    u.'.$conf['user_fields']['username'].' AS username,
+    u.'.$conf['user_fields']['email'].' AS email,
+    ui.status
+  FROM '.USERS_TABLE.' AS u
+    JOIN '.USER_INFOS_TABLE.' AS ui ON ui.user_id = u.'.$conf['user_fields']['id'].'
+  WHERE u.'.$conf['user_fields']['id'].' = '.$params['user_id'][0].'
+;';
+      $target_users = query2array($query);
+
+      if (isset($target_users[0]) and in_array($target_users[0]['status'], array('webmaster', 'admin')))
+      {
+        // the user manager always sends username and email, so we only
+        // reject actual changes (params are escaped, DB values are not)
+        if (
+          (!empty($params['username']) and stripslashes($params['username']) !== $target_users[0]['username'])
+          or (!empty($params['email']) and stripslashes($params['email']) !== $target_users[0]['email'])
+        )
+        {
+          return array(
+            'error' => array(
+              'code' => 403,
+              'message' => 'Only webmasters can change username or email of other "webmaster/admin" users'
+            )
+          );
+        }
+      }
     }
 
     if (!empty($params['username']))

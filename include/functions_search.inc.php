@@ -38,7 +38,9 @@ function get_search_info($candidate)
   }
 
   $query = '
-SELECT *
+SELECT
+    *,
+    (last_used_on IS NULL OR last_used_on < SUBDATE(NOW(), INTERVAL 1 DAY)) AS last_used_on_outdated
   FROM '.SEARCH_TABLE.'
   WHERE '.sprintf($clause_pattern, $candidate).'
 ;';
@@ -58,6 +60,20 @@ SELECT *
     {
       fatal_error('this search is not reachable with its id, need the search_uuid instead');
     }
+
+    // last_used_on is used to purge guest searches. It is NULL until the search
+    // is displayed for the first time, then it is updated at most once a day
+    // to avoid a write on each visit
+    if ($searches[0]['last_used_on_outdated'])
+    {
+      $query = '
+UPDATE '.SEARCH_TABLE.'
+  SET last_used_on = NOW()
+  WHERE id = '.$searches[0]['id'].'
+;';
+      pwg_query($query);
+    }
+    unset($searches[0]['last_used_on_outdated']);
 
     if (isset($page['section']) and 'search' == $page['section'])
     {
@@ -2116,6 +2132,53 @@ SELECT
   }
 }
 
+/**
+ * Deletes the least recently used guest searches, keeping
+ * $conf['guest_searches_max'] of them.
+ * @since 16.5
+ */
+function purge_guest_searches()
+{
+  global $conf;
+
+  // the first search to delete. Searches never displayed since their creation
+  // (last_used_on IS NULL) are sorted last, so they are deleted first: a flood
+  // of created searches can't delete a search a visitor is browsing.
+  $query = '
+SELECT id, last_used_on
+  FROM '.SEARCH_TABLE.'
+  WHERE created_by = '.$conf['guest_id'].'
+  ORDER BY last_used_on DESC, id DESC
+  LIMIT 1 OFFSET '.(int)$conf['guest_searches_max'].'
+;';
+  $limits = query2array($query);
+
+  if (count($limits) > 0)
+  {
+    $limit = $limits[0];
+
+    if (is_null($limit['last_used_on']))
+    {
+      $where = 'last_used_on IS NULL AND id <= '.$limit['id'];
+    }
+    else
+    {
+      $where = '
+      last_used_on IS NULL
+      OR last_used_on < \''.$limit['last_used_on'].'\'
+      OR (last_used_on = \''.$limit['last_used_on'].'\' AND id <= '.$limit['id'].')';
+    }
+
+    $query = '
+DELETE
+  FROM '.SEARCH_TABLE.'
+  WHERE created_by = '.$conf['guest_id'].'
+    AND ('.$where.')
+;';
+    pwg_query($query);
+  }
+}
+
 function save_search($rules, $forked_from=null)
 {
   global $user;
@@ -2133,6 +2196,13 @@ function save_search($rules, $forked_from=null)
       'forked_from' => $forked_from,
     )
   );
+
+  // guest searches are limited, to prevent unbounded growth of the search
+  // table. The purge happens on 1 search out of 100 on average.
+  if (is_a_guest() and 1 == mt_rand(1, 100))
+  {
+    purge_guest_searches();
+  }
 
   if (!is_a_guest() and !is_generic())
   {
